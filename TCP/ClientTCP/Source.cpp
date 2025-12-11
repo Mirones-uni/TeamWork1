@@ -1,50 +1,113 @@
 #define BOOST_DISABLE_CURRENT_LOCATION
 #include <iostream>
+#include <fstream>
+#include <string>
 #include <boost/asio.hpp>
-#include <boost/array.hpp>
-using namespace boost::asio;
 
-int main()
-{
-    // Создаем объект io_context - центральный диспетчер ввода/вывода в Boost.Asio
-    boost::asio::io_context io_context;
+namespace asio = boost::asio;
+using asio::ip::tcp;
 
-    // Создаем TCP-сокет, используя созданный io_context
-    ip::tcp::socket socket(io_context);
+// Функция для извлечения имени файла из пути
+std::string extract_filename(const std::string& file_path) {
+    // Находим последний разделитель пути
+    size_t last_slash = file_path.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+        return file_path.substr(last_slash + 1);
+    }
+    return file_path; // Если нет разделителей, возвращаем весь путь
+}
 
-    // Подключаемся к серверу по адресу 127.0.0.1 (localhost) на порту 8080
-    socket.connect(ip::tcp::endpoint(ip::make_address("127.0.0.1"), 8080));
+int main() {
+    // Фиксированный IP-адрес сервера
+    std::string server_ip = "127.0.0.1";
 
-    // Создаем строку с сообщением для отправки на сервер
-    std::string message = "Hello from client!";
-    // Отправляем сообщение на сервер через сокет
-    write(socket, buffer(message));
+    // Запрашиваем путь к файлу у пользователя
+    std::string file_path;
+    std::cout << "Enter file path to send: ";
+    std::getline(std::cin, file_path);
 
-    // Создаем буфер фиксированного размера (128 байт) для приема данных от сервера
-    boost::array<char, 128> buf;
-    // Создаем объект для хранения кода ошибки
-    boost::system::error_code error;
-    // Читаем данные из сокета в буфер, возвращаем количество прочитанных байт
-    size_t len = socket.read_some(buffer(buf), error);
+    // Удаляем кавычки, если пользователь ввел путь с кавычками (при drag&drop в некоторых системах)
+    if (!file_path.empty() && file_path.front() == '"' && file_path.back() == '"') {
+        file_path = file_path.substr(1, file_path.size() - 2);
+    }
 
-    // Проверяем, закрыл ли сервер соединение (конец файла)
-    if (error == boost::asio::error::eof)
-        std::cout << "Connection closed by server." << std::endl;
-    // Если произошла другая ошибка
-    else if (error)
-        // Генерируем исключение с информацией об ошибке
-        throw boost::system::system_error(error);
+    if (file_path.empty()) {
+        std::cerr << "File path cannot be empty" << std::endl;
+        return 1;
+    }
 
-    // Выводим префикс перед полученными данными
-    std::cout << "Received: ";
-    // Выводим полученные от сервера данные (только фактически прочитанные байты)
-    std::cout.write(buf.data(), len);
-    // Завершаем строку вывода
-    std::cout << std::endl;
+    try {
+        // Проверяем существование файла
+        std::ifstream file(file_path, std::ios::binary | std::ios::ate);
+        if (!file) {
+            std::cerr << "Cannot open file: " << file_path << std::endl;
+            return 1;
+        }
 
-    // Закрываем сокет
-    socket.close();
+        // Получаем размер файла
+        std::streamsize file_size = file.tellg();
+        file.seekg(0, std::ios::beg);
 
-    // Возвращаем 0 - успешное завершение программы
+        if (file_size > 4294967295) {
+            std::cerr << "File is too large (max 4GB)" << std::endl;
+            return 1;
+        }
+
+        // Извлекаем имя файла из пути
+        std::string filename = extract_filename(file_path);
+
+        if (filename.size() > 64) {
+            std::cerr << "Filename is too long (max 64 bytes)" << std::endl;
+            return 1;
+        }
+
+        std::cout << "Preparing to send file: " << filename
+            << " (" << file_size << " bytes)" << std::endl;
+
+        // Читаем содержимое файла
+        std::vector<char> file_data(file_size);
+        if (!file.read(file_data.data(), file_size)) {
+            std::cerr << "Cannot read file" << std::endl;
+            return 1;
+        }
+
+        // Подключаемся к серверу
+        asio::io_context io_context;
+        tcp::socket socket(io_context);
+        tcp::resolver resolver(io_context);
+
+        std::cout << "Connecting to server " << server_ip << "..." << std::endl;
+        asio::connect(socket, resolver.resolve(server_ip, "12345"));
+
+        std::cout << "Connected to server. Sending file..." << std::endl;
+
+        // Отправляем размер файла (в сетевом порядке байт)
+        uint32_t net_file_size = htonl(static_cast<uint32_t>(file_size));
+        asio::write(socket, asio::buffer(&net_file_size, sizeof(net_file_size)));
+
+        // Отправляем имя файла (дополняем до 64 байт)
+        char filename_buffer[64] = { 0 };
+        std::copy(filename.begin(), filename.end(), filename_buffer);
+        asio::write(socket, asio::buffer(filename_buffer, 64));
+
+        // Отправляем содержимое файла
+        asio::write(socket, asio::buffer(file_data));
+
+        std::cout << "File sent. Waiting for confirmation..." << std::endl;
+
+        // Получаем подтверждение от сервера
+        char confirmation[128] = { 0 };
+        size_t len = socket.read_some(asio::buffer(confirmation));
+        std::cout << "Server response: " << std::string(confirmation, len) << std::endl;
+
+        socket.close();
+        std::cout << "Disconnected from server." << std::endl;
+
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Client error: " << e.what() << std::endl;
+        return 1;
+    }
+
     return 0;
 }
