@@ -9,8 +9,6 @@
 #include <windows.h>
 #include <vector>
 #include <sstream>
-#include <thread>
-#include <atomic>
 #include <boost/asio.hpp>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -20,15 +18,15 @@ const int PORT = 12345;
 const char* SERVER_IP = "127.0.0.1";
 const char* DOWNLOAD_FOLDER = "C:\\UDP_Downloads";
 
-// Атомарные флаги для управления потоками
-std::atomic<bool> transferInProgress(false);
-std::atomic<bool> downloadInProgress(false);
-
-// Функция для отправки команды и получения ответа
-std::string SendCommand(SOCKET socket, const std::string& command, sockaddr_in& serverAddr) {
+// Функция для отправки команды с ожиданием ответа
+std::string SendCommand(SOCKET socket, const std::string& command, sockaddr_in& serverAddr, bool waitForResponse = true) {
     // Отправляем команду
     sendto(socket, command.c_str(), command.length(), 0,
         (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+    if (!waitForResponse) {
+        return "";
+    }
 
     // Ждем ответ с таймаутом
     char buffer[BUFFER_SIZE];
@@ -39,7 +37,7 @@ std::string SendCommand(SOCKET socket, const std::string& command, sockaddr_in& 
     FD_SET(socket, &readSet);
 
     struct timeval timeout;
-    timeout.tv_sec = 10;  // 10 секунд таймаут
+    timeout.tv_sec = 10;
     timeout.tv_usec = 0;
 
     if (select(0, &readSet, NULL, NULL, &timeout) > 0) {
@@ -55,72 +53,58 @@ std::string SendCommand(SOCKET socket, const std::string& command, sockaddr_in& 
     return "ERROR:NO_RESPONSE";
 }
 
-// Асинхронная отправка файла
-void AsyncSendFileToServer(SOCKET socket, sockaddr_in& serverAddr) {
-    if (transferInProgress) {
-        std::cout << "ERROR: Another transfer is in progress\n";
+// Отправка файла на сервер
+void SendFileToServer(SOCKET socket, sockaddr_in& serverAddr) {
+    std::string filepath;
+    std::cout << "\nEnter file path: ";
+    std::getline(std::cin, filepath);
+
+    // Проверяем существование файла
+    DWORD attrib = GetFileAttributesA(filepath.c_str());
+    if (attrib == INVALID_FILE_ATTRIBUTES || (attrib & FILE_ATTRIBUTE_DIRECTORY)) {
+        std::cout << "ERROR: File not found\n";
         return;
     }
 
-    transferInProgress = true;
+    // Получаем имя файла
+    std::string filename;
+    size_t lastSlash = filepath.find_last_of("\\/");
+    filename = (lastSlash != std::string::npos) ? filepath.substr(lastSlash + 1) : filepath;
 
-    std::thread([socket, &serverAddr]() {
-        std::string filepath;
-        std::cout << "\nEnter file path: ";
-        std::getline(std::cin, filepath);
+    std::cout << "\nSending file: " << filename << std::endl;
 
-        // Проверяем существование файла
-        DWORD attrib = GetFileAttributesA(filepath.c_str());
-        if (attrib == INVALID_FILE_ATTRIBUTES || (attrib & FILE_ATTRIBUTE_DIRECTORY)) {
-            std::cout << "ERROR: File not found\n";
-            transferInProgress = false;
-            return;
-        }
+    // Отправляем команду SEND
+    std::string response = SendCommand(socket, "SEND " + filename, serverAddr);
+    if (response != "READY") {
+        std::cout << "ERROR: Server not ready: " << response << std::endl;
+        return;
+    }
 
-        // Получаем имя файла
-        std::string filename;
-        size_t lastSlash = filepath.find_last_of("\\/");
-        filename = (lastSlash != std::string::npos) ? filepath.substr(lastSlash + 1) : filepath;
+    // Открываем файл
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        std::cout << "ERROR: Cannot open file\n";
+        return;
+    }
 
-        std::cout << "\nSending file: " << filename << " (async)" << std::endl;
+    // Отправляем файл по частям
+    char buffer[BUFFER_SIZE];
+    int totalSent = 0;
+    int blockCount = 0;
 
-        // Читаем файл
-        std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-        if (!file) {
-            std::cout << "ERROR: Cannot open file\n";
-            transferInProgress = false;
-            return;
-        }
+    while (!file.eof()) {
+        file.read(buffer, sizeof(buffer));
+        std::streamsize bytesRead = file.gcount();
 
-        std::streamsize fileSize = file.tellg();
-        file.seekg(0, std::ios::beg);
+        if (bytesRead > 0) {
+            // Отправляем блок данных
+            sendto(socket, buffer, bytesRead, 0,
+                (sockaddr*)&serverAddr, sizeof(serverAddr));
+            totalSent += bytesRead;
+            blockCount++;
 
-        // Читаем файл в память
-        std::vector<char> buffer(fileSize);
-        if (!file.read(buffer.data(), fileSize)) {
-            std::cout << "ERROR: Cannot read file\n";
-            transferInProgress = false;
-            return;
-        }
-        file.close();
-
-        // Формируем команду с данными файла
-        std::string filedata(buffer.begin(), buffer.end());
-        std::string command = "SEND_FILE:" + filename + ":" + filedata;
-
-        // Отправляем команду
-        std::string response = SendCommand(socket, command, serverAddr);
-        if (response != "READY") {
-            std::cout << "ERROR: Server not ready: " << response << std::endl;
-            transferInProgress = false;
-            return;
-        }
-
-        std::cout << "File sent to server queue. Waiting for confirmation...\n";
-
-        // Ждем финальный ответ
-        while (true) {
-            char responseBuffer[BUFFER_SIZE];
+            // Ждем подтверждение для каждого блока
+            char ack[10];
             int serverSize = sizeof(serverAddr);
 
             fd_set readSet;
@@ -128,34 +112,32 @@ void AsyncSendFileToServer(SOCKET socket, sockaddr_in& serverAddr) {
             FD_SET(socket, &readSet);
 
             struct timeval timeout;
-            timeout.tv_sec = 1;
+            timeout.tv_sec = 5;
             timeout.tv_usec = 0;
 
             if (select(0, &readSet, NULL, NULL, &timeout) > 0) {
-                int bytes = recvfrom(socket, responseBuffer, BUFFER_SIZE, 0,
+                recvfrom(socket, ack, sizeof(ack), 0,
                     (sockaddr*)&serverAddr, &serverSize);
 
-                if (bytes > 0) {
-                    responseBuffer[bytes] = '\0';
-                    std::string finalResponse(responseBuffer);
-
-                    if (finalResponse.substr(0, 5) == "DONE:") {
-                        std::cout << "\n" << finalResponse << std::endl;
-                        break;
-                    }
-                    else if (finalResponse.substr(0, 5) == "ERROR") {
-                        std::cout << "\n" << finalResponse << std::endl;
-                        break;
-                    }
+                if (blockCount % 10 == 0) {
+                    std::cout << "\rSent: " << totalSent << " bytes";
                 }
             }
-
-            std::cout << "." << std::flush;
+            else {
+                std::cout << "\nERROR: No ACK from server, transfer aborted\n";
+                file.close();
+                return;
+            }
         }
+    }
+    file.close();
 
-        transferInProgress = false;
-        std::cout << "File transfer completed.\n";
-        }).detach();
+    // Отправляем сигнал конца
+    sendto(socket, "END", 3, 0, (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+    // Ждем финальный ответ
+    response = SendCommand(socket, "", serverAddr);
+    std::cout << "\n" << response << std::endl;
 }
 
 // Функция для получения списка файлов
@@ -187,137 +169,108 @@ void GetFileList(SOCKET socket, sockaddr_in& serverAddr) {
     }
 }
 
-// Асинхронное скачивание файла
-void AsyncDownloadFile(SOCKET socket, sockaddr_in& serverAddr) {
-    if (downloadInProgress) {
-        std::cout << "ERROR: Another download is in progress\n";
+// Скачивание файла
+void DownloadFile(SOCKET socket, sockaddr_in& serverAddr) {
+    std::string filename;
+    std::cout << "\nEnter filename to download: ";
+    std::getline(std::cin, filename);
+
+    if (filename.empty()) {
+        std::cout << "ERROR: Filename cannot be empty\n";
         return;
     }
 
-    downloadInProgress = true;
+    // Отправляем команду GET
+    std::string response = SendCommand(socket, "GET " + filename, serverAddr);
 
-    std::thread([socket, &serverAddr]() {
-        std::string filename;
-        std::cout << "\nEnter filename to download: ";
-        std::getline(std::cin, filename);
+    if (response.substr(0, 5) == "ERROR") {
+        std::cout << response << std::endl;
+        return;
+    }
 
-        if (filename.empty()) {
-            std::cout << "ERROR: Filename cannot be empty\n";
-            downloadInProgress = false;
-            return;
-        }
+    if (response.substr(0, 10) != "FILE_INFO:") {
+        std::cout << "ERROR: Invalid response: " << response << std::endl;
+        return;
+    }
 
-        // Отправляем команду GET
-        std::string response = SendCommand(socket, "GET " + filename, serverAddr);
+    // Получаем размер файла
+    long long fileSize = std::stoll(response.substr(10));
+    std::cout << "\nDownloading: " << filename << " (" << fileSize << " bytes)" << std::endl;
 
-        if (response.substr(0, 5) == "ERROR") {
-            std::cout << response << std::endl;
-            downloadInProgress = false;
-            return;
-        }
+    // Отправляем подтверждение
+    sendto(socket, "READY", 5, 0, (sockaddr*)&serverAddr, sizeof(serverAddr));
 
-        if (response.substr(0, 10) != "FILE_INFO:") {
-            std::cout << "ERROR: Invalid response: " << response << std::endl;
-            downloadInProgress = false;
-            return;
-        }
+    // Создаем папку для загрузок
+    CreateDirectoryA(DOWNLOAD_FOLDER, NULL);
+    std::string savePath = std::string(DOWNLOAD_FOLDER) + "\\" + filename;
 
-        // Получаем размер файла
-        long long fileSize = std::stoll(response.substr(10));
-        std::cout << "\nDownloading: " << filename << " (" << fileSize << " bytes) (async)" << std::endl;
+    // Открываем файл для записи
+    std::ofstream file(savePath, std::ios::binary);
+    if (!file) {
+        std::cout << "ERROR: Cannot create file\n";
+        return;
+    }
 
-        // Создаем папку для загрузок
-        CreateDirectoryA(DOWNLOAD_FOLDER, NULL);
-        std::string savePath = std::string(DOWNLOAD_FOLDER) + "\\" + filename;
+    // Получаем файл
+    char buffer[BUFFER_SIZE];
+    int serverSize = sizeof(serverAddr);
+    long long totalReceived = 0;
+    int blockCount = 0;
 
-        // Открываем файл для записи
-        std::ofstream file(savePath, std::ios::binary);
-        if (!file) {
-            std::cout << "ERROR: Cannot create file\n";
-            downloadInProgress = false;
-            return;
-        }
+    while (totalReceived < fileSize) {
+        // Ждем данные с таймаутом
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(socket, &readSet);
 
-        // Получаем файл
-        char buffer[BUFFER_SIZE];
-        int serverSize = sizeof(serverAddr);
-        long long totalReceived = 0;
-        bool fileComplete = false;
+        struct timeval timeout;
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
 
-        std::cout << "Waiting for file data...\n";
+        if (select(0, &readSet, NULL, NULL, &timeout) > 0) {
+            int bytes = recvfrom(socket, buffer, BUFFER_SIZE, 0,
+                (sockaddr*)&serverAddr, &serverSize);
 
-        while (totalReceived < fileSize && !fileComplete) {
-            fd_set readSet;
-            FD_ZERO(&readSet);
-            FD_SET(socket, &readSet);
+            if (bytes <= 0) break;
 
-            struct timeval timeout;
-            timeout.tv_sec = 2;
-            timeout.tv_usec = 0;
-
-            if (select(0, &readSet, NULL, NULL, &timeout) > 0) {
-                int bytes = recvfrom(socket, buffer, BUFFER_SIZE, 0,
-                    (sockaddr*)&serverAddr, &serverSize);
-
-                if (bytes <= 0) continue;
-
-                // Проверяем конец файла
-                if (bytes == 11 && strncmp(buffer, "END_OF_FILE", 11) == 0) {
-                    fileComplete = true;
-                    break;
-                }
-
-                file.write(buffer, bytes);
-                totalReceived += bytes;
-
-                // Показываем прогресс каждые 10%
-                if (fileSize > 0 && totalReceived % (fileSize / 10 + 1) == 0) {
-                    int percent = static_cast<int>((totalReceived * 100) / fileSize);
-                    std::cout << "\rProgress: " << percent << "% ("
-                        << totalReceived << "/" << fileSize << " bytes)";
-                }
+            // Проверяем конец файла
+            if (bytes == 11 && strncmp(buffer, "END_OF_FILE", 11) == 0) {
+                break;
             }
-            else {
-                // Таймаут - проверяем, не завершилась ли передача
-                if (totalReceived >= fileSize) {
-                    fileComplete = true;
-                }
+
+            file.write(buffer, bytes);
+            totalReceived += bytes;
+            blockCount++;
+
+            // Отправляем подтверждение для каждого блока
+            sendto(socket, "OK", 2, 0, (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+            if (blockCount % 10 == 0) {
+                std::cout << "\rReceived: " << totalReceived << "/" << fileSize << " bytes";
             }
-        }
-
-        file.close();
-
-        if (fileComplete) {
-            std::cout << "\nFile saved: " << savePath << " ("
-                << totalReceived << " bytes)" << std::endl;
         }
         else {
-            std::cout << "\nDownload incomplete. Received: "
-                << totalReceived << "/" << fileSize << " bytes" << std::endl;
+            std::cout << "\nERROR: Timeout waiting for data\n";
+            break;
         }
+    }
 
-        downloadInProgress = false;
-        }).detach();
-}
+    file.close();
 
-// Функция для проверки состояния асинхронных операций
-void CheckAsyncStatus() {
-    std::cout << "\n=== Async Operations Status ===\n";
-    std::cout << "File transfer in progress: " << (transferInProgress ? "YES" : "NO") << std::endl;
-    std::cout << "File download in progress: " << (downloadInProgress ? "YES" : "NO") << std::endl;
-    std::cout << "================================\n";
+    if (totalReceived == fileSize) {
+        std::cout << "\nFile saved: " << savePath << " (" << totalReceived << " bytes)" << std::endl;
+    }
+    else {
+        std::cout << "\nDownload incomplete: " << totalReceived << "/" << fileSize << " bytes" << std::endl;
+        // Удаляем неполный файл
+        DeleteFileA(savePath.c_str());
+    }
 }
 
 int main() {
     std::cout << "========================================\n";
     std::cout << "   ASYNC UDP FILE CLIENT\n";
-    std::cout << "   Boost.Asio available for networking\n";
-    std::cout << "========================================\n\n";
-
-    std::cout << "Features:\n";
-    std::cout << "- Async file transfers\n";
-    std::cout << "- Non-blocking operations\n";
-    std::cout << "- Progress tracking\n";
+    std::cout << "   Boost.Asio included\n";
     std::cout << "========================================\n\n";
 
     // Инициализация Winsock
@@ -337,9 +290,9 @@ int main() {
         return 1;
     }
 
-    // Делаем сокет неблокирующим
-    u_long mode = 1;
-    ioctlsocket(clientSocket, FIONBIO, &mode);
+    // Устанавливаем таймаут
+    int timeout = 5000;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
     // Настройка адреса сервера
     sockaddr_in serverAddr;
@@ -359,11 +312,10 @@ int main() {
 
     while (true) {
         std::cout << "\nMENU:\n";
-        std::cout << "1. Send file to server (async)\n";
+        std::cout << "1. Send file to server\n";
         std::cout << "2. View files on server\n";
-        std::cout << "3. Download file from server (async)\n";
-        std::cout << "4. Check async status\n";
-        std::cout << "5. Exit\n";
+        std::cout << "3. Download file from server\n";
+        std::cout << "4. Exit\n";
         std::cout << "Choice: ";
 
         int choice;
@@ -372,18 +324,15 @@ int main() {
 
         switch (choice) {
         case 1:
-            AsyncSendFileToServer(clientSocket, serverAddr);
+            SendFileToServer(clientSocket, serverAddr);
             break;
         case 2:
             GetFileList(clientSocket, serverAddr);
             break;
         case 3:
-            AsyncDownloadFile(clientSocket, serverAddr);
+            DownloadFile(clientSocket, serverAddr);
             break;
         case 4:
-            CheckAsyncStatus();
-            break;
-        case 5:
             std::cout << "\nGoodbye!\n";
             closesocket(clientSocket);
             WSACleanup();
@@ -395,10 +344,8 @@ int main() {
             std::cout << "ERROR: Invalid choice\n";
         }
 
-        if (choice != 4) {
-            std::cout << "\nPress Enter to continue...";
-            std::cin.ignore();
-        }
+        std::cout << "\nPress Enter to continue...";
+        std::cin.ignore();
     }
 
     closesocket(clientSocket);
