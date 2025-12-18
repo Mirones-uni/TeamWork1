@@ -9,9 +9,7 @@
 #include <windows.h>
 #include <vector>
 #include <algorithm>
-#include <map>
-#include <conio.h>  // Добавил для _kbhit() и _getch()
-#include <boost/asio.hpp>
+
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -19,30 +17,130 @@ const int BUFFER_SIZE = 65000;
 const int PORT = 12345;
 const char* SAVE_FOLDER = "C:\\UDP_Files";
 
-// Структура для хранения состояния клиента
-struct ClientState {
-    sockaddr_in addr;
-    std::string filename;
-    std::ofstream* fileStream;
-    int bytesReceived;
-    time_t lastActivity;
-    bool receivingFile;
-};
-
-// Map для отслеживания клиентов
-std::map<std::string, ClientState> activeClients;
-
-// Функция для генерации ID клиента
-std::string GetClientID(sockaddr_in addr) {
-    char ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
-    return std::string(ip) + ":" + std::to_string(ntohs(addr.sin_port));
-}
-
 // Функция для отправки ответа клиенту
 void SendResponse(SOCKET socket, const std::string& response, sockaddr_in clientAddr) {
     sendto(socket, response.c_str(), response.length(), 0,
         (sockaddr*)&clientAddr, sizeof(clientAddr));
+}
+
+// Функция для сохранения файла
+void SaveFile(SOCKET socket, const std::string& filename, sockaddr_in clientAddr) {
+    // Создаем папку если её нет
+    CreateDirectoryA(SAVE_FOLDER, NULL);
+
+    // Создаем уникальное имя файла
+    std::string filepath = std::string(SAVE_FOLDER) + "\\" + filename;
+    int counter = 1;
+
+    while (GetFileAttributesA(filepath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        size_t dot = filename.find_last_of('.');
+        std::string name = filename.substr(0, dot);
+        std::string ext = (dot != std::string::npos) ? filename.substr(dot) : "";
+        filepath = std::string(SAVE_FOLDER) + "\\" + name + "_" + std::to_string(counter) + ext;
+        counter++;
+    }
+
+    // Отправляем подтверждение
+    SendResponse(socket, "READY", clientAddr);
+
+    // Открываем файл для записи
+    std::ofstream file(filepath, std::ios::binary);
+    if (!file) {
+        SendResponse(socket, "ERROR:CANNOT_CREATE_FILE", clientAddr);
+        return;
+    }
+
+    std::cout << "Receiving file: " << filename << " -> " << filepath << std::endl;
+
+    // Принимаем данные
+    char buffer[BUFFER_SIZE];
+    int clientSize = sizeof(clientAddr);
+    int totalBytes = 0;
+
+    while (true) {
+        int bytes = recvfrom(socket, buffer, BUFFER_SIZE, 0,
+            (sockaddr*)&clientAddr, &clientSize);
+
+        if (bytes <= 0) break;
+
+        // Проверяем конец передачи
+        if (bytes == 3 && strncmp(buffer, "END", 3) == 0) {
+            break;
+        }
+
+        // Записываем данные
+        file.write(buffer, bytes);
+        totalBytes += bytes;
+
+        // Отправляем подтверждение
+        SendResponse(socket, "OK", clientAddr);
+
+        // Прогресс
+        std::cout << "\rReceived: " << totalBytes << " bytes";
+    }
+
+    file.close();
+    std::cout << "\nFile saved: " << totalBytes << " bytes" << std::endl;
+    SendResponse(socket, "DONE:" + std::to_string(totalBytes), clientAddr);
+}
+
+// Функция для отправки файла клиенту
+void SendFile(SOCKET socket, const std::string& filename, sockaddr_in clientAddr) {
+    std::string filepath = std::string(SAVE_FOLDER) + "\\" + filename;
+
+    // Проверяем существование файла
+    if (GetFileAttributesA(filepath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        SendResponse(socket, "ERROR:FILE_NOT_FOUND", clientAddr);
+        return;
+    }
+
+    // Открываем файл для чтения
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        SendResponse(socket, "ERROR:CANNOT_OPEN_FILE", clientAddr);
+        return;
+    }
+
+    // Получаем размер файла
+    std::streamsize fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Отправляем информацию о файле
+    SendResponse(socket, "FILE_INFO:" + std::to_string(fileSize), clientAddr);
+
+    // Ждем подтверждение
+    char ack[10];
+    int clientSize = sizeof(clientAddr);
+    recvfrom(socket, ack, sizeof(ack), 0, (sockaddr*)&clientAddr, &clientSize);
+
+    std::cout << "Sending file: " << filename << " (" << fileSize << " bytes)" << std::endl;
+
+    // Отправляем файл по частям
+    char buffer[BUFFER_SIZE];
+    int totalSent = 0;
+
+    while (!file.eof()) {
+        file.read(buffer, sizeof(buffer));
+        std::streamsize bytesRead = file.gcount();
+
+        if (bytesRead > 0) {
+            sendto(socket, buffer, bytesRead, 0,
+                (sockaddr*)&clientAddr, sizeof(clientAddr));
+            totalSent += bytesRead;
+
+            // Ждем подтверждение
+            recvfrom(socket, ack, sizeof(ack), 0, (sockaddr*)&clientAddr, &clientSize);
+
+            // Прогресс
+            std::cout << "\rSent: " << totalSent << "/" << fileSize << " bytes";
+        }
+    }
+
+    file.close();
+
+    // Отправляем сигнал конца
+    SendResponse(socket, "END_OF_FILE", clientAddr);
+    std::cout << "\nFile sent successfully" << std::endl;
 }
 
 // Функция для получения списка файлов
@@ -64,182 +162,9 @@ std::vector<std::string> GetFileList() {
     return files;
 }
 
-// Обработка команд
-void HandleCommand(SOCKET socket, sockaddr_in clientAddr, const std::string& command) {
-    std::string clientID = GetClientID(clientAddr);
-    char clientIP[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
-
-    std::cout << "[" << clientID << "] Command: " << command << std::endl;
-
-    if (command == "TEST") {
-        SendResponse(socket, "SERVER_READY", clientAddr);
-    }
-    else if (command == "LIST") {
-        auto files = GetFileList();
-        std::string response = "FILES_COUNT:" + std::to_string(files.size());
-        for (const auto& f : files) {
-            response += ":" + f;
-        }
-        SendResponse(socket, response, clientAddr);
-    }
-    else if (command.substr(0, 4) == "SEND") {
-        // Проверяем, не занят ли клиент уже передачей файла
-        auto it = activeClients.find(clientID);
-        if (it != activeClients.end() && it->second.receivingFile) {
-            SendResponse(socket, "ERROR:ALREADY_RECEIVING", clientAddr);
-            return;
-        }
-
-        std::string filename = command.substr(5);
-
-        // Создаем папку если её нет
-        CreateDirectoryA(SAVE_FOLDER, NULL);
-
-        // Создаем уникальное имя файла
-        std::string filepath = std::string(SAVE_FOLDER) + "\\" + filename;
-        int counter = 1;
-
-        while (GetFileAttributesA(filepath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            size_t dot = filename.find_last_of('.');
-            std::string name = filename.substr(0, dot);
-            std::string ext = (dot != std::string::npos) ? filename.substr(dot) : "";
-            filepath = std::string(SAVE_FOLDER) + "\\" + name + "_" + std::to_string(counter) + ext;
-            counter++;
-        }
-
-        // Открываем файл для записи
-        std::ofstream* file = new std::ofstream(filepath, std::ios::binary);
-        if (!file->is_open()) {
-            SendResponse(socket, "ERROR:CANNOT_CREATE_FILE", clientAddr);
-            delete file;
-            return;
-        }
-
-        // Сохраняем состояние клиента
-        ClientState state;
-        state.addr = clientAddr;
-        state.filename = filename;
-        state.fileStream = file;
-        state.bytesReceived = 0;
-        state.lastActivity = time(nullptr);
-        state.receivingFile = true;
-
-        activeClients[clientID] = state;
-
-        // Отправляем подтверждение
-        SendResponse(socket, "READY", clientAddr);
-        std::cout << "[" << clientID << "] Ready to receive file: " << filename << std::endl;
-    }
-    else if (command.substr(0, 3) == "GET") {
-        std::string filename = command.substr(4);
-        std::string filepath = std::string(SAVE_FOLDER) + "\\" + filename;
-
-        // Проверяем существование файла
-        if (GetFileAttributesA(filepath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            SendResponse(socket, "ERROR:FILE_NOT_FOUND", clientAddr);
-            return;
-        }
-
-        // Открываем файл для чтения
-        std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-        if (!file) {
-            SendResponse(socket, "ERROR:CANNOT_OPEN_FILE", clientAddr);
-            return;
-        }
-
-        // Получаем размер файла
-        std::streamsize fileSize = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        // Отправляем информацию о файле
-        SendResponse(socket, "FILE_INFO:" + std::to_string(fileSize), clientAddr);
-
-        std::cout << "[" << clientID << "] Sending file info: " << filename
-            << " (" << fileSize << " bytes)" << std::endl;
-
-        // Закрываем файл - дальше будем читать в отдельной функции
-        file.close();
-    }
-    else if (command == "END") {
-        // Завершение передачи файла
-        auto it = activeClients.find(clientID);
-        if (it != activeClients.end() && it->second.receivingFile) {
-            it->second.fileStream->close();
-            delete it->second.fileStream;
-
-            std::string response = "DONE:" + std::to_string(it->second.bytesReceived);
-            SendResponse(socket, response, clientAddr);
-
-            std::cout << "[" << clientID << "] File received: " << it->second.filename
-                << " (" << it->second.bytesReceived << " bytes)" << std::endl;
-
-            activeClients.erase(it);
-        }
-    }
-    else {
-        SendResponse(socket, "ERROR:UNKNOWN_COMMAND", clientAddr);
-    }
-}
-
-// Обработка данных файла
-void HandleFileData(SOCKET socket, sockaddr_in clientAddr, const char* data, int dataSize) {
-    std::string clientID = GetClientID(clientAddr);
-
-    auto it = activeClients.find(clientID);
-    if (it != activeClients.end() && it->second.receivingFile) {
-        // Записываем данные в файл
-        it->second.fileStream->write(data, dataSize);
-        it->second.bytesReceived += dataSize;
-        it->second.lastActivity = time(nullptr);
-
-        // Отправляем подтверждение
-        SendResponse(socket, "OK", clientAddr);
-
-        // Показываем прогресс каждые 1MB
-        if (it->second.bytesReceived % (1024 * 1024) < dataSize) {
-            std::cout << "[" << clientID << "] Received: "
-                << it->second.bytesReceived << " bytes" << std::endl;
-        }
-    }
-    else {
-        // Клиент не инициировал передачу файла
-        SendResponse(socket, "ERROR:NOT_READY", clientAddr);
-    }
-}
-
-// Очистка неактивных клиентов
-void CleanupInactiveClients() {
-    time_t now = time(nullptr);
-    std::vector<std::string> toRemove;
-
-    for (auto& pair : activeClients) {
-        if (now - pair.second.lastActivity > 30) { // 30 секунд бездействия
-            if (pair.second.receivingFile) {
-                pair.second.fileStream->close();
-                delete pair.second.fileStream;
-                std::cout << "[" << pair.first << "] Connection timeout, file transfer aborted" << std::endl;
-            }
-            toRemove.push_back(pair.first);
-        }
-    }
-
-    for (const auto& clientID : toRemove) {
-        activeClients.erase(clientID);
-    }
-}
-
 int main() {
     std::cout << "========================================\n";
-    std::cout << "   ASYNC UDP FILE SERVER (Single-threaded)\n";
-    std::cout << "   Boost.Asio included\n";
-    std::cout << "========================================\n\n";
-
-    std::cout << "Features:\n";
-    std::cout << "- Single-threaded async processing\n";
-    std::cout << "- Multiple concurrent clients\n";
-    std::cout << "- Non-blocking I/O\n";
-    std::cout << "- Automatic client cleanup\n";
+    std::cout << "   UDP FILE SERVER\n";
     std::cout << "========================================\n\n";
 
     // Инициализация Winsock
@@ -274,13 +199,6 @@ int main() {
         return 1;
     }
 
-    // Делаем сокет неблокирующим
-    u_long mode = 1;
-    ioctlsocket(serverSocket, FIONBIO, &mode);
-
-    // Создаем папку для файлов
-    CreateDirectoryA(SAVE_FOLDER, NULL);
-
     std::cout << "Server started on port " << PORT << std::endl;
     std::cout << "Files folder: " << SAVE_FOLDER << std::endl;
     std::cout << "\nWaiting for connections...\n";
@@ -291,75 +209,59 @@ int main() {
     sockaddr_in clientAddr;
     int clientSize = sizeof(clientAddr);
 
-    time_t lastCleanup = time(nullptr);
-
     while (true) {
-        // Принимаем сообщение (неблокирующий вызов)
+        // Ждем команду от клиента
         int bytes = recvfrom(serverSocket, buffer, BUFFER_SIZE, 0,
             (sockaddr*)&clientAddr, &clientSize);
 
-        if (bytes == SOCKET_ERROR) {
-            int error = WSAGetLastError();
-            if (error == WSAEWOULDBLOCK) {
-                // Нет данных для чтения
-                Sleep(10); // Небольшая пауза
-            }
-            else {
-                std::cout << "Receive error: " << error << std::endl;
-            }
-        }
-        else if (bytes > 0) {
+        if (bytes > 0) {
             buffer[bytes] = '\0';
+            std::string command(buffer);
 
-            // Проверяем, это команда или данные файла
-            std::string clientID = GetClientID(clientAddr);
-            auto it = activeClients.find(clientID);
+            // Определяем IP клиента
+            char clientIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
 
-            if (it != activeClients.end() && it->second.receivingFile) {
-                // Это данные файла
-                if (bytes == 3 && strncmp(buffer, "END", 3) == 0) {
-                    HandleCommand(serverSocket, clientAddr, "END");
+            std::cout << "Client " << clientIP << ": " << command << std::endl;
+
+            // Обработка команд
+            if (command == "TEST") {
+                // Тест соединения
+                SendResponse(serverSocket, "SERVER_READY", clientAddr);
+
+            }
+            else if (command == "LIST") {
+                // Список файлов
+                auto files = GetFileList();
+                std::string response = "FILES_COUNT:" + std::to_string(files.size());
+                for (const auto& f : files) {
+                    response += ":" + f;
                 }
-                else {
-                    HandleFileData(serverSocket, clientAddr, buffer, bytes);
-                }
+                SendResponse(serverSocket, response, clientAddr);
+
+            }
+            else if (command.substr(0, 4) == "SEND") {
+                // Отправка файла на сервер
+                std::string filename = command.substr(5); // Пропускаем "SEND "
+                SaveFile(serverSocket, filename, clientAddr);
+
+            }
+            else if (command.substr(0, 3) == "GET") {
+                // Получение файла с сервера
+                std::string filename = command.substr(4); // Пропускаем "GET "
+                SendFile(serverSocket, filename, clientAddr);
+
             }
             else {
-                // Это команда
-                std::string command(buffer);
-                HandleCommand(serverSocket, clientAddr, command);
+                SendResponse(serverSocket, "ERROR:UNKNOWN_COMMAND", clientAddr);
             }
-        }
 
-        // Периодически очищаем неактивных клиентов
-        time_t now = time(nullptr);
-        if (now - lastCleanup > 10) { // Каждые 10 секунд
-            CleanupInactiveClients();
-            lastCleanup = now;
-        }
-
-        // Проверяем, не нажал ли пользователь клавишу для выхода
-        if (_kbhit()) {
-            char ch = _getch();
-            if (ch == 'q' || ch == 'Q') {
-                std::cout << "\nShutting down server...\n";
-                break;
-            }
+            std::cout << std::endl;
         }
     }
 
-    // Очистка
-    for (auto& pair : activeClients) {
-        if (pair.second.receivingFile && pair.second.fileStream) {
-            pair.second.fileStream->close();
-            delete pair.second.fileStream;
-        }
-    }
-
+    // Закрытие сокета (никогда не выполнится в бесконечном цикле)
     closesocket(serverSocket);
     WSACleanup();
-
-    std::cout << "Server stopped.\n";
-    system("pause");
     return 0;
 }
