@@ -10,14 +10,15 @@ using asio::ip::tcp;
 namespace fs = boost::filesystem;
 
 enum Command {
-    CMD_SEND_FILE = 1,     // Клиент хочет отправить файл на сервер
-    CMD_REQUEST_FILE = 2   // Клиент запрашивает файл с сервера
+    CMD_SEND_FILE = 1,
+    CMD_REQUEST_FILE = 2,
+    CMD_LIST_FILES = 3  
 };
 
 int main() 
 {
     // Фиксированный путь для сохранения файлов
-    fs::path save_directory = "C:/Users/karas/OneDrive/Desktop/test";
+    fs::path save_directory = "C:/Server_directory";
         try {
             // Создаем директорию, если она не существует
             if (!fs::exists(save_directory)) {
@@ -111,6 +112,28 @@ int main()
                         // Отправляем подтверждение
                         std::string confirmation = "File received successfully: " + file_path.filename().string();
                         asio::write(socket, asio::buffer(confirmation));
+
+                    }
+                    else if (command == CMD_LIST_FILES) {
+                        std::cout <<  "Client requested file list." << std::endl;
+
+                        // Собираем имена всех файлов в save_directory
+                        std::string file_list;
+                        for (const auto& entry : fs::directory_iterator(save_directory)) {
+                            if (entry.is_regular_file()) {
+                                if (!file_list.empty()) file_list += " ";
+                                file_list += entry.path().filename().string();
+                            }
+                        }
+
+                        if (file_list.empty()) {
+                            file_list = "No files found.";
+                        }
+
+                        std::cout << "Sending file list:\n" << file_list << std::endl;
+
+                        // Отправляем список файлов
+                        asio::write(socket, asio::buffer(file_list));
 
                     }
                     else if (command == CMD_REQUEST_FILE) {
